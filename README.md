@@ -1,4 +1,4 @@
-# reusable-manual-release
+# Reusable Manual Release
 
 A reusable GitHub Actions workflow that manually creates a versioned GitHub release with AI-generated release notes summarised from the git history since the last release.
 
