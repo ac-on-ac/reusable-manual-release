@@ -1,0 +1,160 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - rc-patch
+          - rc-minor
+          - rc-major
+
+  workflow_call:
+    inputs:
+      version_type:
+        description: 'Version bump type (patch, minor, major, rc-patch, rc-minor, rc-major)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  models: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate version_type input
+        run: |
+          case "${{ inputs.version_type }}" in
+            patch|minor|major|rc-patch|rc-minor|rc-major) ;;
+            *) echo "::error::Invalid version_type '${{ inputs.version_type }}'. Must be one of: patch, minor, major, rc-patch, rc-minor, rc-major." && exit 1 ;;
+          esac
+
+      - name: Compute version, summarize changes, and create release
+        uses: actions/github-script@v8
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { execSync } = require('child_process');
+
+            // Get all tags sorted by version, newest first
+            let allTags = [];
+            try {
+              allTags = execSync('git tag --sort=-version:refname').toString().trim().split('\n').filter(Boolean);
+            } catch { /* no tags yet */ }
+
+            // Latest tag (any), used as the diff base
+            const latestTag = allTags[0] ?? null;
+
+            // Last stable (non-RC) tag, used as the semver bump base
+            const lastStableTag = allTags.find(t => !t.includes('-rc.')) ?? null;
+
+            // Parse semver from a tag string, ignoring any -rc.N suffix
+            function parseSemver(tag) {
+              const m = (tag ?? '').replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)/);
+              return m ? [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])] : [0, 0, 0];
+            }
+
+            // Return the RC number from a tag like v1.2.3-rc.4, or 0 if not an RC
+            function rcNumber(tag) {
+              const m = (tag ?? '').match(/-rc\.(\d+)$/);
+              return m ? parseInt(m[1]) : 0;
+            }
+
+            const [major, minor, patch] = parseSemver(lastStableTag);
+            const versionType = '${{ inputs.version_type }}';
+
+            // For rc-* types: compute the target base version, then check whether the
+            // latest tag is already an RC for that same base — if so, increment the RC
+            // number rather than resetting to rc.1.
+            function rcVersion(targetBase) {
+              const latestBase = (latestTag ?? '').replace(/^v/, '').split('-rc.')[0];
+              const n = rcNumber(latestTag);
+              return (latestBase === targetBase && n > 0)
+                ? `v${targetBase}-rc.${n + 1}`
+                : `v${targetBase}-rc.1`;
+            }
+
+            let newVersion;
+            switch (versionType) {
+              case 'patch':    newVersion = `v${major}.${minor}.${patch + 1}`; break;
+              case 'minor':    newVersion = `v${major}.${minor + 1}.0`; break;
+              case 'major':    newVersion = `v${major + 1}.0.0`; break;
+              case 'rc-patch': newVersion = rcVersion(`${major}.${minor}.${patch + 1}`); break;
+              case 'rc-minor': newVersion = rcVersion(`${major}.${minor + 1}.0`); break;
+              case 'rc-major': newVersion = rcVersion(`${major + 1}.0.0`); break;
+            }
+
+            core.info(`Creating release ${newVersion} (latest tag: ${latestTag ?? 'none'}, last stable: ${lastStableTag ?? 'none'})`);
+
+            // Gather git log and diff stat since last tag
+            const rangeArg = latestTag ? `${latestTag}..HEAD` : 'HEAD';
+            const gitLog = execSync(`git log ${rangeArg} --oneline`).toString().trim();
+            const diffStat = execSync(`git diff ${rangeArg} --stat`).toString().trim();
+
+            // Generate release notes
+            let releaseNotes;
+            if (!gitLog) {
+              releaseNotes = '_No changes detected since the last release._';
+            } else {
+              const prompt = [
+                'Summarize the following git changes into concise release notes.',
+                'Focus on what changed and why it matters to users.',
+                'Use plain language and format as a short bulleted list.\n',
+                `Commits:\n${gitLog}\n`,
+                `Changed files:\n${diffStat}`
+              ].join('\n');
+
+              const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+                },
+                body: JSON.stringify({
+                  model: 'gpt-4o-mini',
+                  messages: [
+                    {
+                      role: 'system',
+                      content: 'You are a technical writer generating GitHub release notes.'
+                    },
+                    { role: 'user', content: prompt }
+                  ],
+                  max_tokens: 500
+                })
+              });
+
+              if (!response.ok) {
+                throw new Error(`GitHub Models API error: ${response.status} ${await response.text()}`);
+              }
+
+              const data = await response.json();
+              releaseNotes = data.choices[0].message.content;
+            }
+
+            // Create the release — GitHub automatically creates the tag at HEAD
+            const isPrerelease = newVersion.includes('-rc.');
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: newVersion,
+              name: newVersion,
+              body: releaseNotes,
+              prerelease: isPrerelease
+            });
+
+            core.info(`✅ Release created: ${release.html_url}`);
